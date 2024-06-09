@@ -1,123 +1,91 @@
-extern crate base64;
-extern crate hex;
-extern crate crypto;
-
 use clap::Parser;
-use crypto::{symmetriccipher::{ SynchronousStreamCipher}};
-use rustc_serialize::hex::FromHex;
-use core::str;
-use std::iter::repeat;
-use core::fmt::Write;
-use log::{debug, error};
-
-use rand::rngs::OsRng;
-use rand::rngs::adapter::ReseedingRng;
-use rand::prelude::*;
+use crypto::{chacha20::ChaCha20, symmetriccipher::SynchronousStreamCipher};
+use rand::{prelude::*, rngs::OsRng};
 use rand_chacha::ChaCha20Core;
+use std::{fmt::Write, str, iter::repeat};
+use rustc_serialize::hex::FromHex;
 
-fn hex_to_bytes(s: &str) -> Vec<u8> {
-  debug!("hex to bytes({:#?})", s);
-  s.from_hex().unwrap()
-}
-
-
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
-  /// Message
-  message: Option<String>,
+    /// Message
+    message: Option<String>,
 
-  /// Key
-  #[arg(short, long)]
-  key: Option<String>,
+    /// Key
+    #[arg(short, long)]
+    key: Option<String>,
 
-  /// IV
-  #[arg(short, long)]
-  iv: Option<String>,
+    /// IV
+    #[arg(short, long)]
+    iv: Option<String>,
+
+    /// Decrypt
+    #[arg(short, long)]
+    decrypt: bool,
 }
 
-fn get_rand(len: i32) -> Vec<u8> {
-  let prng = ChaCha20Core::from_entropy();
-  let _ = ReseedingRng::new(prng, 0, OsRng);
-  let random_bytes: Vec<u8> = (0..len).map(|_| { rand::random::<u8>() }).collect();
-
-  random_bytes
+fn hex_to_bytes(s: &str) -> Vec<u8> {
+    log::debug!("hex to bytes({:#?})", s);
+    s.from_hex().unwrap()
 }
 
-fn bytes_to_hex(a: Vec<u8>) -> Result<String, std::fmt::Error> {
-  let mut s = String::with_capacity(2 * a.len());
-  for byte in a {
-    write!(s, "{:02X}", byte)?;
-  }
-
-  Ok(s)
+fn get_rand(len: usize) -> Vec<u8> {
+    let prng = ChaCha20Core::from_entropy();
+    let _ = rand::rngs::adapter::ReseedingRng::new(prng, 0, OsRng);
+    (0..len).map(|_| rand::random::<u8>()).collect()
 }
 
-fn main() -> () {
-  env_logger::init();
-
-  let msg;
-  let mut decrypt: bool = false;
-  let mut mykey = String::new();
-  let mut myiv = String::new();
-
-  let cli = Cli::parse();
-
-  if let Some(message) = cli.message.as_deref() {
-    msg = message;
-  } else {
-    error!("Missing message");
-    std::process::exit(1);
-  }
-
-  if let Some(key) = cli.key.as_deref() {
-    mykey = key.to_string();
-    decrypt = true;
-  } else {
-    let r = get_rand(32);
-    let b = bytes_to_hex(r).unwrap();
-
-    for c in b.chars() {
-      mykey.push(c);
+fn bytes_to_hex(a: &[u8]) -> String {
+    let mut s = String::with_capacity(2 * a.len());
+    for byte in a {
+        write!(s, "{:02X}", byte).unwrap();
     }
-  }
+    s
+}
 
-  if let Some(iv) = cli.iv.as_deref() {
-    myiv = iv.to_string();
-  } else {
-    let r = get_rand(24);
-    let b = bytes_to_hex(r).unwrap();
+fn main() {
+    env_logger::init();
 
-    for c in b.chars() {
-      myiv.push(c);
+    let cli = Cli::parse();
+
+    let msg = cli.message
+            .as_deref()
+            .expect("Missing message. Provide a message.");
+
+    let (key, iv) = if let Some(key) = cli.key.as_deref() {
+        (hex_to_bytes(key), hex_to_bytes(&cli.iv.unwrap_or_else(|| String::new())))
+    } else {
+        let key = get_rand(32);
+        let iv = get_rand(24);
+        (key, iv)
+    };
+
+    log::debug!("== XChaCha20 ==");
+    log::debug!("Message: {:?}", msg);
+    log::debug!("Key: {:?}", bytes_to_hex(&key));
+    log::debug!("IV: {:?}", bytes_to_hex(&iv));
+
+    if !cli.decrypt {
+        // Encrypt
+        let mut cipher = ChaCha20::new_xchacha20(&key, &iv);
+        let plaintext = msg.as_bytes();
+        let mut output = vec![0; plaintext.len()];
+        cipher.process(plaintext, &mut output);
+
+        println!(
+            "{{ \"key\": \"{}\", \"iv\": \"{}\", \"data\": \"{}\" }}",
+            bytes_to_hex(&key).to_lowercase(),
+            bytes_to_hex(&iv).to_lowercase(),
+            hex::encode(output)
+        );
+    } else {
+        // Decrypt
+        let encrypted = &hex_to_bytes(&msg)[..];
+        let mut c = ChaCha20::new_xchacha20(&key, &iv);
+        let mut output: Vec<u8> = repeat(0).take(encrypted.len()).collect();
+
+        c.process(&encrypted[..], &mut output[..]);
+
+        print!("{}", str::from_utf8(&output[..]).unwrap());
     }
-  }
-
-  debug!("== XChaCha20 ==");
-  debug!("Message: {:?}", msg);
-  debug!("Key: {:?}", mykey);
-  debug!("IV: {:?}", myiv);
-
-  let key = &hex_to_bytes(&mykey)[..];
-  let iv = &hex_to_bytes(&myiv)[..];
-
-  if !decrypt {
-    // Encrypt
-    let plain = msg.as_bytes();
-    let mut c = crypto::chacha20::ChaCha20::new_xchacha20(&key, iv);
-    let mut output: Vec<u8> = repeat(0).take(plain.len()).collect();
-
-    c.process(&plain[..], &mut output[..]);
-
-    println!("{{ \"key\": \"{}\", \"iv\": \"{}\", \"data\": \"{}\" }}", mykey.to_lowercase(), myiv.to_lowercase(), hex::encode(output.clone()));
-  } else {
-    // Decrypt
-    let encrypted = &hex_to_bytes(&msg)[..];
-    let mut c = crypto::chacha20::ChaCha20::new_xchacha20(&key, iv);
-    let mut output: Vec<u8> = repeat(0).take(encrypted.len()).collect();
-
-    c.process(&encrypted[..], &mut output[..]);
-
-    print!("{}", str::from_utf8(&output[..]).unwrap());
-  }
 }
